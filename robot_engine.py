@@ -1,26 +1,37 @@
 #!/usr/bin/env python3
 """
-Taiwan Stock NT$100,000 Autonomous Paper-Trading AI Robot (v2 — Cloud & Mobile Edition)
-======================================================================================
-Institutional-Grade Zero-Cheating Architecture:
-1. 65-Stock High-Liquidity Taiwan Universe across 12 Sectors (TWSE/TPEx leaders).
-2. Strict T-Day Order Generation -> T+1 OHLC Trigger Fill (Zero Close-Price Cheating!):
-   - Day T (13:55): Computes tomorrow's TWSE tick-calibrated Limit Buy orders & OCO
-     Stop-Loss / Trailing-Stop / Take-Profit orders based strictly on data up to Day T.
-   - Day T+1 (13:55): Verifies Day T's pending orders against Day T+1's REAL Open,
-     High, Low, Close. Buy fills ONLY if Low <= LimitBuy; Sell checks conservative
-     SL-first rule (Low <= SL -> filled at min(Open, SL), else High >= TP -> max(Open, TP)).
-3. Risk & Diversification Discipline:
-   - Max 4 concurrent positions (~24% equity each), Max 2 stocks per sector.
-   - Market Regime Gate (0050 vs MA20 & MA60): BULL=4 slots, CAUTION=2 slots, BEAR=0 new buys.
-   - Volatility-Adjusted Momentum Ranking (RS_20D / ATR%) + Anti-Chasing & RSI Guard.
-   - Real Taiwan odd-lot frictions: 0.1425% fee (min NT$1) + 0.30% sell tax + 0.10% slippage.
+Taiwan Stock NT$100,000 Autonomous Paper-Trading AI Robot (v3 — 4-Layer Quant Engine)
+=====================================================================================
+Drop-in upgrade for `robot_engine.py` (100% compatible with existing GitHub Actions,
+requirements.txt, and docs/index.html mobile dashboard).
+
+4-Layer Institutional Decision Framework:
+  Layer 1 — Market Regime Gate (0050 vs MA20 & MA60):
+    BULL = up to 4 positions (~24% each), CAUTION = up to 2 positions, BEAR = 0 new buys.
+  Layer 2 — Official Fundamentals & Monthly Revenue (TWSE + TPEx Keyless OpenAPI):
+    Filters out revenue contraction (YoY < -15%) and unsupported high-PE bubbles
+    (PE > 40 without >= 25% YoY growth); rewards strong YoY growth + low PE / high yield.
+  Layer 3 — Price/Volume Trend & Risk-Adjusted Momentum (65-Stock 12-Sector Universe):
+    Confirmed uptrend (Close > MA20, MA5 >= MA20), anti-chasing (<= +10% above MA20,
+    RSI 48-74), positive 20D relative strength vs 0050, sector cap <= 2.
+  Layer 4 — Google News RSS Major Negative-Event Filter (避雷針):
+    Scans recent Chinese financial headlines for the top finalists and automatically
+    skips stocks hit by severe negative news (下修財測 / 砍單 / 虧損 / 違約 / 停工等).
+  Execution — Strict T-Day Pending Smart Orders -> T+1 Real OHLC Trigger Fill:
+    Zero close-price cheating; conservative SL-before-TP tie-break; TWSE Art. 62 ticks;
+    real Taiwan odd-lot frictions (0.1425% fee, 0.30% sell tax, 0.10% slippage/side).
 """
+import concurrent.futures
 import csv
 import datetime
 import json
 import os
+import re
+import ssl
 import sys
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -39,6 +50,11 @@ TAX_STOCK = 0.003
 SLIPPAGE = 0.001
 MAX_POSITIONS = 4
 MAX_PER_SECTOR = 2
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+}
 
 # 65 High-Liquidity Taiwan Leaders across 12 Diversified Sectors
 UNIVERSE: Dict[str, Dict[str, str]] = {
@@ -120,6 +136,12 @@ UNIVERSE: Dict[str, Dict[str, str]] = {
     "2207": {"name": "和泰車", "sym": "2207.TW", "sector": "傳產工業"},
 }
 
+NEWS_RED_FLAGS = [
+    "下修財測", "調降財測", "砍單", "虧損", "重挫", "跌停", "違約",
+    "掏空", "停工", "火災", "遭罰", "不如預期", "調降評等", "大減", "利空", "衰退",
+]
+NEWS_POS_WORDS = ["創高", "大增", "成長", "調升", "滿載", "優於預期", "擴產", "獲利"]
+
 
 def get_twse_tick(price: float) -> float:
     if price < 10.0: return 0.01
@@ -138,23 +160,116 @@ def round_twse_tick(price: float) -> float:
     return round(r, dec)
 
 
+def parse_num(val) -> Optional[float]:
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", "").replace("+", "").replace("X", "")
+    if not s or s in ("-", "--", "---", "----", "N/A", "NaN"):
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def http_get_json(url: str, timeout: int = 14):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def fetch_official_fundamentals() -> Dict[str, dict]:
+    """
+    Fetch official keyless TWSE + TPEx PE, Dividend Yield, PB, and Monthly Revenue YoY%.
+    Gracefully returns partial/empty dict if any exchange endpoint times out.
+    """
+    urls = {
+        "twse_val": "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
+        "twse_rev": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+        "tpex_val": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
+        "tpex_rev": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+    }
+    raw = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(http_get_json, u, 14): k for k, u in urls.items()}
+        for f in concurrent.futures.as_completed(futs):
+            k = futs[f]
+            try:
+                raw[k] = f.result() or []
+            except Exception as exc:
+                print(f"[Fundamentals] Warning {k}: {exc}")
+                raw[k] = []
+
+    fund: Dict[str, dict] = {}
+    for r in raw.get("twse_val", []):
+        c = str(r.get("Code", "")).strip()
+        if c in UNIVERSE:
+            fund.setdefault(c, {})
+            fund[c]["pe"] = parse_num(r.get("PEratio"))
+            fund[c]["dy"] = parse_num(r.get("DividendYield"))
+            fund[c]["pb"] = parse_num(r.get("PBratio"))
+
+    for r in raw.get("tpex_val", []):
+        c = str(r.get("SecuritiesCompanyCode", "")).strip()
+        if c in UNIVERSE:
+            fund.setdefault(c, {})
+            fund[c]["pe"] = parse_num(r.get("PriceEarningRatio"))
+            fund[c]["dy"] = parse_num(r.get("YieldRatio"))
+            fund[c]["pb"] = parse_num(r.get("PriceBookRatio"))
+
+    for key in ("twse_rev", "tpex_rev"):
+        for r in raw.get(key, []):
+            c = str(r.get("公司代號", "")).strip()
+            if c in UNIVERSE:
+                fund.setdefault(c, {})
+                fund[c]["rev_yoy"] = parse_num(r.get("營業收入-去年同月增減(%)"))
+
+    return fund
+
+
+def check_news_red_flags(stock_name: str, code: str) -> Tuple[bool, str]:
+    """
+    Scans latest 10 Chinese financial headlines via Google News RSS.
+    Returns (is_blocked, note). Never crashes if offline or blocked.
+    """
+    try:
+        q = urllib.parse.quote(f"{stock_name} {code} 財報 OR 法說 OR 營收")
+        url = f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            root = ET.fromstring(resp.read())
+        titles = [item.findtext("title", "") for item in root.findall(".//item")[:10]]
+        if not titles:
+            return False, "新聞無異常"
+        neg_hits = sum(sum(1 for w in NEWS_RED_FLAGS if w in t) for t in titles)
+        pos_hits = sum(sum(1 for w in NEWS_POS_WORDS if w in t) for t in titles)
+        if neg_hits >= 3 and neg_hits > pos_hits:
+            return True, f"新聞避雷(負面關鍵字{neg_hits}次 > 正面{pos_hits}次)"
+        return False, f"新聞正常(正{pos_hits}/負{neg_hits})"
+    except Exception:
+        return False, "新聞檢查略過"
+
+
 def default_state() -> dict:
     return {
-        "version": "v2_t1_trigger_65",
+        "version": "v3_4layer_t1_65",
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "start_capital": START_CAPITAL,
         "cash": START_CAPITAL,
         "benchmark_0050_start_price": None,
         "benchmark_0050_shares": 0,
         "benchmark_0050_cash": START_CAPITAL,
-        "positions": {},       # code -> {name, sector, shares, entry_price, cost_twd, peak_price, entry_date, last_price, atr}
-        "pending_orders": [],  # [{action: BUY/SELL, code, name, sector, shares, limit_price, sl_price, tp_price, reason, created_date}]
+        "positions": {},
+        "pending_orders": [],
         "trade_log": [],
         "equity_history": [],
         "last_run_date": "",
         "last_run_time": "",
         "last_regime": "尚未執行",
-        "last_summary": "機器人已就緒，首次執行將建立明日掛單清單並自下一個交易日起嚴格驗證觸價成交。",
+        "last_summary": "v3 四層引擎已就緒（大盤濾網 × 官方月營收/PE × 價量動能 × 新聞避雷）。",
     }
 
 
@@ -196,12 +311,10 @@ def compute_rsi(series: pd.Series, n: int = 14) -> float:
     d = series.diff()
     up = d.clip(lower=0.0).ewm(alpha=1.0 / n, adjust=False).mean()
     dn = (-d.clip(upper=0.0)).ewm(alpha=1.0 / n, adjust=False).mean()
-    val = 100.0 - (100.0 / (1.0 + float(up.iloc[-1]) / (float(dn.iloc[-1]) + 1e-9)))
-    return round(val, 1)
+    return round(100.0 - (100.0 / (1.0 + float(up.iloc[-1]) / (float(dn.iloc[-1]) + 1e-9))), 1)
 
 
 def fetch_market_snapshot() -> Dict[str, dict]:
-    """Batch-download past 5 months of daily OHLCV for all 65 stocks + 0050.TW (~15 seconds)."""
     import yfinance as yf
 
     syms = [v["sym"] for v in UNIVERSE.values()] + ["0050.TW"]
@@ -249,11 +362,17 @@ def fetch_market_snapshot() -> Dict[str, dict]:
     return snap
 
 
-def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bool = False) -> dict:
+def run_daily_cycle(
+    market_snapshot: Optional[Dict[str, dict]] = None,
+    fundamentals_map: Optional[Dict[str, dict]] = None,
+    news_checker=None,
+    force: bool = False,
+) -> dict:
     """
-    Executes ONE strict zero-cheating daily cycle:
+    Executes ONE strict zero-cheating daily cycle (v3 — 4-Layer Quant Engine):
     Phase 1: Settle yesterday's pending smart orders against TODAY's real Open/High/Low.
-    Phase 2: Evaluate today's close & generate TOMORROW's pending smart orders (Buy Limit + OCO Exit).
+    Phase 2: Combine Regime + Official Fundamentals (Rev YoY, PE, DY) + Technicals
+             + News Red-Flag Filter to generate TOMORROW's pending smart orders.
     """
     state = load_state()
     snap = market_snapshot if market_snapshot is not None else fetch_market_snapshot()
@@ -263,6 +382,9 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
     today = snap["0050"]["date"]
     if (not force) and state.get("last_run_date") == today:
         return {"status": "skipped", "message": f"交易日 {today} 已完成結算與掛單。", "state": state}
+
+    fund_map = fundamentals_map if fundamentals_map is not None else fetch_official_fundamentals()
+    check_news_fn = news_checker if news_checker is not None else check_news_red_flags
 
     # Initialize 0050 Benchmark on Day 1
     p0050 = snap["0050"]["close"]
@@ -279,18 +401,16 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
     positions = state["positions"]
 
     # =========================================================================
-    # PHASE 1: Settle Yesterday's Pending Orders Against TODAY's Real OHLC!
+    # PHASE 1: Settle Yesterday's Pending Orders Against TODAY's Real OHLC
     # =========================================================================
     prev_orders = state.get("pending_orders") or []
-    # 1A. Settle SELL / OCO orders first (frees cash & enforces risk control first)
     for ord_item in [o for o in prev_orders if o["action"] == "SELL"]:
         code = ord_item["code"]
         if code not in positions or code not in snap:
             continue
         q = snap[code]
         pos = positions[code]
-        fill_price = None
-        fill_reason = None
+        fill_price, fill_reason = None, None
 
         if ord_item.get("order_kind") == "MARKET_OPEN":
             fill_price = q["open"]
@@ -298,7 +418,6 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
         else:
             sl_p = float(ord_item["sl_price"])
             tp_p = float(ord_item["tp_price"])
-            # Conservative tie-break: check Stop-Loss BEFORE Take-Profit!
             if q["low"] <= sl_p:
                 fill_price = min(q["open"], sl_p)
                 fill_reason = f"盤中觸發停損/移停價 {sl_p} (今日低點 {q['low']})"
@@ -324,7 +443,6 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
             events.append(f"賣出成交 {pos['name']}({code}) @ {fill_price:.1f} ({pnl:+,.0f}元)")
             del positions[code]
 
-    # 1B. Settle BUY Limit orders (fills ONLY if today's Low <= yesterday's Limit Buy!)
     for ord_item in [o for o in prev_orders if o["action"] == "BUY"]:
         code = ord_item["code"]
         if code in positions or code not in snap:
@@ -336,9 +454,8 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
         if q["low"] <= lim_p:
             fill_price = min(q["open"], lim_p)
             exec_p = fill_price * (1.0 + SLIPPAGE)
-            # Re-verify cash so we never overdraft
-            max_affordable = int((float(state["cash"]) * 0.99) // (exec_p * (1.0 + FEE_RATE)))
-            shares = min(int(ord_item["shares"]), max_affordable)
+            max_aff = int((float(state["cash"]) * 0.99) // (exec_p * (1.0 + FEE_RATE)))
+            shares = min(int(ord_item["shares"]), max_aff)
             if shares < 1:
                 continue
             gross = exec_p * shares
@@ -361,7 +478,6 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
         else:
             events.append(f"未觸價失效：{ord_item['name']}({code}) 限價 {lim_p} (今日低點 {q['low']})")
 
-    # Update mark-to-market & peak prices on surviving holdings
     holdings_val = 0.0
     for code, pos in positions.items():
         if code in snap:
@@ -373,24 +489,24 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
     total_eq = round(float(state["cash"]) + holdings_val, 0)
 
     # =========================================================================
-    # PHASE 2: Generate TOMORROW's (T+1) Pending Smart Orders from Today's Close
+    # PHASE 2: 4-Layer Screening & Tomorrow's (T+1) Pending Smart Orders
     # =========================================================================
     m0050 = snap["0050"]
     above_20 = m0050["close"] > m0050["ma20"]
     above_60 = m0050["close"] > m0050["ma60"]
     if above_20 and above_60:
         regime, max_slots = "BULL", 4
-        regime_label = "🟢 多頭格局 (0050站穩月線與季線｜上限4檔分散)"
+        regime_label = "🟢 多頭格局 (0050站穩月季線｜上限4檔｜v3四層引擎)"
     elif above_60 or above_20:
         regime, max_slots = "CAUTION", 2
-        regime_label = "🟡 震盪警戒 (0050介於月季線間｜上限2檔・半倉防守)"
+        regime_label = "🟡 震盪警戒 (0050介於月季線間｜上限2檔｜v3四層引擎)"
     else:
         regime, max_slots = "BEAR", 0
-        regime_label = "🔴 空頭警戒 (0050跌破月線與季線｜禁止新買進・現金保護)"
+        regime_label = "🔴 空頭警戒 (0050雙破月季線｜禁止新買進・現金保護)"
 
     new_pending: List[dict] = []
 
-    # 2A. Generate OCO Exit Orders (or Market Open Trend-Break Exit) for Every Held Position
+    # 2A. OCO Exit / Trend-Break Orders for Held Positions
     for code, pos in positions.items():
         if code not in snap:
             continue
@@ -399,13 +515,12 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
         entry_p = float(pos["entry_price"])
         peak_p = float(pos["peak_price"])
 
-        # Trend break: if closed below MA20 by > 1%, schedule exit at tomorrow's Open
         if q["close"] < q["ma20"] * 0.99:
             new_pending.append({
                 "action": "SELL", "order_kind": "MARKET_OPEN", "code": code,
                 "name": pos["name"], "sector": pos["sector"], "shares": int(pos["shares"]),
                 "limit_price": q["close"], "sl_price": q["close"], "tp_price": q["close"],
-                "reason": f"收盤({q['close']})跌破20日線({q['ma20']})，明日開盤市價出場",
+                "reason": f"收盤({q['close']})跌破20日線({q['ma20']})，明日開盤出場",
                 "created_date": today,
             })
         else:
@@ -417,73 +532,103 @@ def run_daily_cycle(market_snapshot: Optional[Dict[str, dict]] = None, force: bo
                 "action": "SELL", "order_kind": "OCO_STOP_PROFIT", "code": code,
                 "name": pos["name"], "sector": pos["sector"], "shares": int(pos["shares"]),
                 "limit_price": None, "sl_price": active_sl, "tp_price": tp_p,
-                "reason": f"大戶投OCO停損停利：觸及 {active_sl} 停損/鎖利，或觸及 {tp_p} 停利",
+                "reason": f"大戶投OCO：停損/移停 {active_sl}｜停利 {tp_p}",
                 "created_date": today,
             })
 
-    # 2B. Generate Limit Buy Orders for Open Slots (with Sector Cap <= 2!)
+    # 2B. 4-Layer Entry Filter (Regime + Official Rev YoY/PE/DY + Technicals + News Red-Flag)
     open_slots = max(0, max_slots - len(positions))
+    news_skipped = []
+
     if open_slots > 0 and float(state["cash"]) >= 12_000.0:
         sector_counts: Dict[str, int] = {}
         for pos in positions.values():
-            sec = pos["sector"]
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            sector_counts[pos["sector"]] = sector_counts.get(pos["sector"], 0) + 1
 
         cands = []
         for code, meta in UNIVERSE.items():
             if code in positions or code not in snap:
                 continue
             q = snap[code]
+            f = fund_map.get(code, {})
+            pe = f.get("pe")
+            dy = f.get("dy")
+            rev_yoy = f.get("rev_yoy")
+
             dist_ma20 = q["close"] / q["ma20"] - 1.0
             rs20 = q["ret20"] - m0050["ret20"]
             atr_pct = q["atr14"] / max(1.0, q["close"])
 
-            # Strict Institutional Entry Filters
+            # Technical Hard Gates
             if q["close"] <= q["ma20"] or q["ma5"] < q["ma20"] * 0.995:
                 continue
-            if dist_ma20 > 0.10:
-                continue  # Anti-chasing guard
-            if q["rsi14"] < 48 or q["rsi14"] > 74:
+            if dist_ma20 > 0.10 or q["rsi14"] < 48 or q["rsi14"] > 74 or q["ret1"] <= -0.03:
                 continue
-            if q["ret1"] <= -0.03:
-                continue  # No falling knife
             if rs20 <= (0.03 if regime == "CAUTION" else 0.0):
                 continue
 
-            # Risk-Adjusted Momentum + Money Flow Score
-            score = (rs20 / max(0.015, atr_pct)) * 10.0 + q["cmf10"] * 25.0
-            cands.append((score, code, meta, q))
+            # Fundamental Hard Gates (Layer 2: Official TWSE/TPEx Rev YoY + PE)
+            if rev_yoy is not None and rev_yoy < -15.0:
+                continue  # Reject severe revenue contraction
+            if pe is not None and pe > 40.0 and (rev_yoy is None or rev_yoy < 25.0):
+                continue  # Reject unsupported high-PE bubble
+
+            # Composite Score: Risk-Adjusted Momentum + CMF + Fundamental Growth/Value Bonus
+            tech_s = (rs20 / max(0.015, atr_pct)) * 10.0 + q["cmf10"] * 22.0
+            rev_bonus = float(np.clip((rev_yoy or 0.0) * 0.25, -4.0, 12.0)) if rev_yoy is not None else 0.0
+            val_bonus = (5.0 if (pe is not None and 0 < pe <= 18.0) else 0.0) + (4.0 if (dy is not None and dy >= 3.5) else 0.0)
+            total_s = tech_s + rev_bonus + val_bonus
+            cands.append((total_s, code, meta, q, f))
 
         cands.sort(key=lambda x: x[0], reverse=True)
         alloc_per_slot = min(float(state["cash"]) / open_slots * 0.96, total_eq * 0.24)
         placed = 0
-        for score, code, meta, q in cands:
+
+        for total_s, code, meta, q, f in cands[:10]:
             if placed >= open_slots:
                 break
             sec = meta["sector"]
             if sector_counts.get(sec, 0) >= MAX_PER_SECTOR:
                 continue
-            # Patient Pullback Limit Buy: Close - 0.30 * ATR14 (TWSE tick calibrated)
+
+            # Layer 4: News Major Red-Flag Filter on top finalists only!
+            blocked, news_note = check_news_fn(meta["name"], code)
+            if blocked:
+                news_skipped.append(f"{meta['name']}({code}): {news_note}")
+                continue
+
             lim_buy = round_twse_tick(q["close"] - 0.30 * q["atr14"])
             sl_p = round_twse_tick(max(lim_buy * 0.93, lim_buy - 1.8 * q["atr14"]))
             tp_p = round_twse_tick(lim_buy + 3.5 * q["atr14"])
             shares = int(alloc_per_slot // (lim_buy * (1.0 + SLIPPAGE + FEE_RATE)))
             if shares < 1:
                 continue
+
+            rev_str = f"營收{f['rev_yoy']:+.1f}%" if f.get("rev_yoy") is not None else "營收--"
+            pe_str = f"PE {f['pe']:.1f}" if f.get("pe") is not None else "PE --"
             new_pending.append({
                 "action": "BUY", "order_kind": "LIMIT_PULLBACK", "code": code,
                 "name": meta["name"], "sector": sec, "shares": shares,
                 "limit_price": lim_buy, "sl_price": sl_p, "tp_price": tp_p,
-                "reason": f"風險調整動能強(RS {(q['ret20']-m0050['ret20'])*100:+.1f}%｜RSI {q['rsi14']})，明日拉回限價 {lim_buy} 承接",
+                "reason": f"RS {(q['ret20']-m0050['ret20'])*100:+.1f}%｜{rev_str}｜{pe_str}｜{news_note}",
                 "created_date": today,
             })
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
             placed += 1
 
+    state["version"] = "v3_4layer_t1_65"
     state["pending_orders"] = new_pending
     net_profit = round(total_eq - START_CAPITAL, 0)
     ret_pct = round((total_eq / START_CAPITAL - 1.0) * 100.0, 2)
-    summary = "；".join(events) if events else f"今日無觸價成交｜已開出明日 {len(new_pending)} 筆智慧掛單"
+
+    parts = []
+    if events:
+        parts.append("；".join(events))
+    else:
+        parts.append(f"今日無觸價成交｜已開出明日 {len(new_pending)} 筆掛單")
+    if news_skipped:
+        parts.append("新聞避雷跳過：" + "、".join(news_skipped))
+    summary = "｜".join(parts)
 
     entry = {
         "date": today, "total_equity": total_eq, "net_profit": net_profit, "return_pct": ret_pct,
