@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-Hant" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="10萬AI操盤v2" />
+  <title>台股 10 萬元 AI 操盤機器人 v2 (65檔・T+1觸價)</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Noto Sans TC', sans-serif; background: #0b1120; color: #e2e8f0; }
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="min-h-screen bg-[#0b1120] text-slate-200 pb-12">
+
+  <header class="sticky top-0 z-20 bg-[#0b1120]/95 backdrop-blur border-b border-slate-800 px-4 py-3">
+    <div class="max-w-xl mx-auto flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-500 to-blue-600 flex items-center justify-center text-white font-black text-xs">v2</div>
+        <div>
+          <h1 class="text-sm font-extrabold text-white">10萬元 AI 操盤機器人 (65檔・T+1觸價)</h1>
+          <p id="syncLine" class="text-[10px] text-slate-400 font-mono">載入雲端帳本中...</p>
+        </div>
+      </div>
+      <button type="button" onclick="loadData()" class="px-2.5 py-1.5 rounded-xl bg-slate-800 text-xs text-slate-200 active:scale-95 transition">🔄</button>
+    </div>
+  </header>
+
+  <main class="max-w-xl mx-auto px-4 pt-4 space-y-4">
+
+    <!-- Market Regime Banner -->
+    <section class="bg-[#131d31] border border-slate-800 rounded-2xl p-3.5 space-y-1">
+      <div class="flex items-center justify-between">
+        <span id="regimeBadge" class="text-xs font-extrabold text-white">--</span>
+        <span id="tradeDatePill" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">--</span>
+      </div>
+      <p id="summaryLine" class="text-[11px] text-slate-400 leading-relaxed">--</p>
+    </section>
+
+    <!-- 1. Tomorrow's Pending Smart Orders (T日開單 -> T+1日大戶投直接照抄掛單!) -->
+    <section class="bg-gradient-to-br from-[#131d31] to-[#0f172a] border border-blue-500/40 rounded-2xl p-4 space-y-3 shadow-lg">
+      <div class="flex items-center justify-between">
+        <h2 class="text-xs font-extrabold text-blue-300">🎫 明日大戶投智慧單掛單清單 (T+1 觸價生效)</h2>
+        <button type="button" id="copyAllOrdersBtn" class="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-[10px] font-bold text-white">📋 複製全部掛單</button>
+      </div>
+      <div id="pendingOrdersWrap" class="space-y-2 text-xs"></div>
+    </section>
+
+    <!-- 2. Equity & Benchmark KPI Cards -->
+    <section class="grid grid-cols-2 gap-3" id="kpiWrap"></section>
+
+    <!-- 3. Daily Equity Curve -->
+    <section class="bg-[#131d31] border border-slate-800 rounded-2xl p-4">
+      <div class="text-xs font-bold text-slate-200 mb-2">📈 每日總資產成長 (AI 機器人 vs. 同期 0050)</div>
+      <div class="relative h-52"><canvas id="eqChart"></canvas></div>
+    </section>
+
+    <!-- 4. Current Holdings (Max 4 Diversified) -->
+    <section class="space-y-2">
+      <div class="flex items-center justify-between px-1">
+        <h2 class="text-xs font-bold text-white">💼 目前持股 (最多4檔・同產業≤2檔)</h2>
+        <span id="cashBadge" class="text-[11px] font-mono text-emerald-300">--</span>
+      </div>
+      <div id="holdingsWrap" class="space-y-2"></div>
+    </section>
+
+    <!-- 5. Verified T+1 Fill History -->
+    <section class="space-y-2">
+      <div class="flex items-center justify-between px-1">
+        <h2 class="text-xs font-bold text-white">📜 實盤觸價成交紀錄 (已扣稅費與滑價)</h2>
+        <span id="tradesCnt" class="text-[11px] font-mono text-slate-400">0 筆</span>
+      </div>
+      <div id="tradesWrap" class="space-y-2"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 hidden bg-slate-900 border border-blue-500/40 text-white text-xs px-4 py-2 rounded-xl shadow-2xl"></div>
+
+  <script>
+    let STATE = null;
+    let CHART = null;
+    let TOAST_T = null;
+
+    function toast(m) {
+      const el = document.getElementById("toast");
+      el.textContent = m; el.classList.remove("hidden");
+      clearTimeout(TOAST_T); TOAST_T = setTimeout(() => el.classList.add("hidden"), 2800);
+    }
+    function pnlCol(v) { return v > 0 ? "text-red-400" : (v < 0 ? "text-emerald-400" : "text-slate-300"); }
+
+    async function loadData() {
+      try {
+        const res = await fetch("./portfolio_state.json?t=" + Date.now(), { cache: "no-store" });
+        STATE = await res.json();
+        render(STATE);
+      } catch (e) {
+        document.getElementById("pendingOrdersWrap").textContent = "尚無雲端帳本，請先至 GitHub Actions 手動執行一次。";
+      }
+    }
+
+    function render(st) {
+      document.getElementById("syncLine").textContent = `更新時間：${st.last_run_time || "待首次執行"}`;
+      document.getElementById("tradeDatePill").textContent = st.last_run_date || "Day 0";
+      document.getElementById("regimeBadge").textContent = st.last_regime || "尚未執行";
+      document.getElementById("summaryLine").textContent = st.last_summary || "";
+
+      // Pending Orders for Tomorrow
+      const pend = st.pending_orders || [];
+      const pWrap = document.getElementById("pendingOrdersWrap");
+      if (pend.length === 0) {
+        pWrap.innerHTML = `<div class="bg-slate-950/70 border border-slate-800 rounded-xl p-3 text-slate-400 text-center">☕ 明日無須新掛單（空頭保護或尚無符合條件之標的）。</div>`;
+      } else {
+        pWrap.innerHTML = pend.map(o => {
+          const isBuy = o.action === "BUY";
+          const tagCls = isBuy ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40" : "bg-red-500/20 text-red-300 border-red-500/40";
+          const priceLine = isBuy
+            ? `🟢 限價買進 <strong class="text-white">${o.limit_price}</strong> (${o.shares}股)｜預設停損 ${o.sl_price} / 停利 ${o.tp_price}`
+            : (o.order_kind === "MARKET_OPEN"
+                ? `🔴 明日開盤市價賣出 <strong class="text-white">${o.shares}股</strong>`
+                : `🔴 OCO 賣出 (${o.shares}股)｜停損/移停 <strong class="text-amber-300">${o.sl_price}</strong>｜停利 <strong class="text-red-300">${o.tp_price}</strong>`);
+          return `
+            <div class="bg-slate-950/85 border border-slate-800 rounded-xl p-3 space-y-1">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-1.5">
+                  <span class="px-1.5 py-0.5 rounded border text-[10px] font-bold ${tagCls}">${isBuy ? '明日買單' : '明日賣單'}</span>
+                  <span class="font-bold text-white">${o.name}</span>
+                  <span class="font-mono text-blue-400">${o.code}</span>
+                  <span class="text-[10px] text-slate-400">${o.sector || ''}</span>
+                </div>
+              </div>
+              <div class="font-mono text-[11px] text-slate-200">${priceLine}</div>
+              <div class="text-[10px] text-slate-400">${o.reason}</div>
+            </div>
+          `;
+        }).join("");
+      }
+
+      // KPIs
+      const posEntries = Object.entries(st.positions || {});
+      let holdVal = 0;
+      posEntries.forEach(([_, p]) => { holdVal += (p.shares || 0) * (p.last_price || p.entry_price || 0); });
+      const totalEq = Math.round((st.cash || 0) + holdVal);
+      const startCap = st.start_capital || 100000;
+      const pnl = totalEq - startCap;
+      const retPct = ((totalEq / startCap - 1) * 100).toFixed(2);
+      const hist = st.equity_history || [];
+      const benchEq = hist.length ? Math.round(hist[hist.length - 1].bench_0050_equity || startCap) : startCap;
+      const benchPct = ((benchEq / startCap - 1) * 100).toFixed(2);
+
+      document.getElementById("kpiWrap").innerHTML = `
+        <div class="bg-[#131d31] border border-slate-800 rounded-2xl p-3.5">
+          <div class="text-[10px] text-slate-400">💰 機器人總資產</div>
+          <div class="text-lg font-black font-mono text-white mt-0.5 tabular-nums">NT$${totalEq.toLocaleString()}</div>
+          <div class="text-xs font-mono font-bold ${pnlCol(pnl)}">${pnl >= 0 ? '+' : ''}${pnl.toLocaleString()} (${pnl >= 0 ? '+' : ''}${retPct}%)</div>
+        </div>
+        <div class="bg-[#131d31] border border-slate-800 rounded-2xl p-3.5">
+          <div class="text-[10px] text-slate-400">📊 同期 0050 對照</div>
+          <div class="text-lg font-black font-mono text-blue-300 mt-0.5 tabular-nums">NT$${benchEq.toLocaleString()}</div>
+          <div class="text-xs font-mono ${pnlCol(benchEq - startCap)}">${benchEq >= startCap ? '+' : ''}${benchPct}% (${hist.length}日)</div>
+        </div>
+      `;
+      document.getElementById("cashBadge").textContent = `現金 NT$${Math.round(st.cash || 0).toLocaleString()}`;
+
+      // Holdings
+      const hWrap = document.getElementById("holdingsWrap");
+      if (posEntries.length === 0) {
+        hWrap.innerHTML = `<div class="bg-[#131d31] border border-slate-800 rounded-xl p-4 text-center text-xs text-slate-500">目前空手持有現金</div>`;
+      } else {
+        hWrap.innerHTML = posEntries.map(([code, p]) => {
+          const mv = Math.round(p.shares * p.last_price);
+          const upnl = Math.round(mv - p.cost_twd);
+          const upct = ((mv / p.cost_twd - 1) * 100).toFixed(2);
+          return `
+            <div class="bg-[#131d31] border border-slate-800 rounded-xl p-3 flex justify-between items-center text-xs">
+              <div>
+                <div class="font-bold text-white">${p.name} <span class="font-mono text-blue-400">${code}</span> <span class="text-[10px] text-slate-400 font-normal">${p.sector}</span></div>
+                <div class="text-[10px] text-slate-400 font-mono">${p.shares}股｜成本 ${p.entry_price} (${p.entry_date})｜波段高 ${p.peak_price}</div>
+              </div>
+              <div class="text-right font-mono">
+                <div class="font-black text-white">${p.last_price}</div>
+                <div class="text-[11px] font-bold ${pnlCol(upnl)}">${upnl >= 0 ? '+' : ''}${upnl.toLocaleString()} (${upnl >= 0 ? '+' : ''}${upct}%)</div>
+              </div>
+            </div>
+          `;
+        }).join("");
+      }
+
+      // Trades
+      const trades = (st.trade_log || []).slice().reverse().slice(0, 25);
+      document.getElementById("tradesCnt").textContent = `共 ${(st.trade_log || []).length} 筆`;
+      const tWrap = document.getElementById("tradesWrap");
+      if (trades.length === 0) {
+        tWrap.innerHTML = `<div class="bg-[#131d31] border border-slate-800 rounded-xl p-4 text-center text-xs text-slate-500">尚無成交紀錄（需等隔日盤中觸及限價才算成交）</div>`;
+      } else {
+        tWrap.innerHTML = trades.map(t => `
+          <div class="bg-[#131d31] border border-slate-800 rounded-xl p-3 text-xs space-y-1">
+            <div class="flex justify-between">
+              <div><span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${t.action === 'BUY' ? 'bg-red-500/20 text-red-300' : 'bg-emerald-500/20 text-emerald-300'}">${t.action === 'BUY' ? '買進' : '賣出'}</span> <strong class="text-white">${t.name} ${t.code}</strong> <span class="font-mono text-slate-400">${t.shares}股 @ ${t.price}</span></div>
+              <span class="font-mono text-[10px] text-slate-400">${t.date}</span>
+            </div>
+            <div class="flex justify-between text-[11px]">
+              <span class="text-slate-400">${t.reason}</span>
+              ${t.action === 'SELL' ? `<span class="font-mono font-bold ${pnlCol(t.pnl)}">${t.pnl >= 0 ? '+' : ''}${t.pnl.toLocaleString()} (${t.ret_pct >= 0 ? '+' : ''}${t.ret_pct}%)</span>` : `<span class="font-mono text-slate-500">費 -$${t.fee_tax}</span>`}
+            </div>
+          </div>
+        `).join("");
+      }
+
+      // Chart
+      const ctx = document.getElementById("eqChart").getContext("2d");
+      const labels = hist.length ? hist.map(h => h.date.slice(5)) : ["Day 0"];
+      const rVals = hist.length ? hist.map(h => h.total_equity) : [startCap];
+      const bVals = hist.length ? hist.map(h => h.bench_0050_equity) : [startCap];
+      if (CHART) CHART.destroy();
+      CHART = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "AI機器人", data: rVals, borderColor: "#10b981", backgroundColor: "rgba(16,185,129,0.12)", fill: true, borderWidth: 2, tension: 0.25 },
+            { label: "0050對照", data: bVals, borderColor: "#60a5fa", borderDash: [4, 4], borderWidth: 1.8, tension: 0.25 }
+          ]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: "#cbd5e1", boxWidth: 10, font: { size: 10 } } } },
+          scales: { x: { ticks: { color: "#94a3b8", font: { size: 9 } }, grid: { display: false } }, y: { ticks: { color: "#94a3b8", font: { size: 9 } }, grid: { color: "rgba(148,163,184,0.12)" } } }
+        }
+      });
+    }
+
+    document.getElementById("copyAllOrdersBtn").addEventListener("click", () => {
+      if (!STATE || !STATE.pending_orders || STATE.pending_orders.length === 0) { toast("明日沒有待掛單"); return; }
+      const lines = [`【台股 10萬 AI 機器人 v2｜明日大戶投掛單清單 (${STATE.last_run_date})】`];
+      STATE.pending_orders.forEach(o => {
+        if (o.action === "BUY") lines.push(`• 🟢 買進 ${o.name}(${o.code}) ${o.shares}股｜限價 ${o.limit_price}｜停損 ${o.sl_price} / 停利 ${o.tp_price}`);
+        else lines.push(`• 🔴 賣出 ${o.name}(${o.code}) ${o.shares}股｜${o.order_kind === 'MARKET_OPEN' ? '開盤市價出場' : `OCO 停損 ${o.sl_price} / 停利 ${o.tp_price}`}`);
+      });
+      const txt = lines.join("\n");
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(() => toast("已複製明日全部大戶投掛單！"));
+      else { const ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); toast("已複製明日全部大戶投掛單！"); }
+    });
+
+    document.addEventListener("DOMContentLoaded", loadData);
+  </script>
+</body>
+</html>

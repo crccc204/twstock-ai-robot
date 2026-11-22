@@ -1,0 +1,17 @@
+{
+  "version": "v2_t1_trigger_65",
+  "created_at": "2026-11-22 16:22:01",
+  "start_capital": 100000.0,
+  "cash": 100000.0,
+  "benchmark_0050_start_price": null,
+  "benchmark_0050_shares": 0,
+  "benchmark_0050_cash": 100000.0,
+  "positions": {},
+  "pending_orders": [],
+  "trade_log": [],
+  "equity_history": [],
+  "last_run_date": "",
+  "last_run_time": "",
+  "last_regime": "尚未執行",
+  "last_summary": "機器人已就緒，首次執行將建立明日掛單清單並自下一個交易日起嚴格驗證觸價成交。"
+}
