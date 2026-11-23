@@ -315,15 +315,23 @@ def compute_rsi(series: pd.Series, n: int = 14) -> float:
 
 
 def fetch_market_snapshot() -> Dict[str, dict]:
+    import time
     import yfinance as yf
 
-    syms = [v["sym"] for v in UNIVERSE.values()] + ["0050.TW"]
-    raw = yf.download(syms, period="5mo", interval="1d", auto_adjust=True, group_by="ticker", threads=True, progress=False)
+    # Prevent yfinance SQLite cache lock ('database is locked') on GitHub Actions
+    try:
+        yf.set_tz_cache_location("/tmp/yf_tz_cache")
+    except Exception:
+        pass
+
     snap: Dict[str, dict] = {}
 
-    def parse_one(code: str, sym: str):
+    def parse_df(code: str, df: pd.DataFrame):
         try:
-            df = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+            if df is None or df.empty:
+                return
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.droplevel(0, axis=1) if "Close" not in df.columns.get_level_values(0) else df.droplevel(1, axis=1)
             df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
             if len(df) < 62:
                 return
@@ -356,9 +364,33 @@ def fetch_market_snapshot() -> Dict[str, dict]:
         except Exception:
             pass
 
-    for code, meta in UNIVERSE.items():
-        parse_one(code, meta["sym"])
-    parse_one("0050", "0050.TW")
+    # Step 1: Download benchmark 0050.TW cleanly with threads=False + retry
+    for attempt in range(3):
+        try:
+            df0050 = yf.download("0050.TW", period="5mo", interval="1d", auto_adjust=True, threads=False, progress=False)
+            parse_df("0050", df0050)
+            if "0050" in snap:
+                break
+        except Exception:
+            pass
+        time.sleep(2)
+
+    # Step 2: Download 65 stocks in safe single-threaded batches (zero SQLite lock!)
+    items = list(UNIVERSE.items())
+    for i in range(0, len(items), 25):
+        chunk = items[i:i + 25]
+        syms = [meta["sym"] for _, meta in chunk]
+        try:
+            raw = yf.download(syms, period="5mo", interval="1d", auto_adjust=True, group_by="ticker", threads=False, progress=False)
+            for code, meta in chunk:
+                try:
+                    sub = raw[meta["sym"]] if isinstance(raw.columns, pd.MultiIndex) else raw
+                    parse_df(code, sub)
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"[MarketData] Batch {i} warning: {exc}")
+
     return snap
 
 
