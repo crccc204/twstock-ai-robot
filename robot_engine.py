@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Taiwan Stock NT$100,000 Autonomous Paper-Trading AI Robot (v3 — 4-Layer Quant Engine)
+Taiwan Stock NT$100,000 Autonomous Paper-Trading AI Robot (v3.1 — Strict Through-Fill 4-Layer Engine)
 =====================================================================================
 Drop-in upgrade for `robot_engine.py` (100% compatible with existing GitHub Actions,
 requirements.txt, and docs/index.html mobile dashboard).
@@ -255,7 +255,7 @@ def check_news_red_flags(stock_name: str, code: str) -> Tuple[bool, str]:
 
 def default_state() -> dict:
     return {
-        "version": "v3_4layer_t1_65",
+        "version": "v3.1_through_fill_65",
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "start_capital": START_CAPITAL,
         "cash": START_CAPITAL,
@@ -418,12 +418,14 @@ def run_daily_cycle(
         else:
             sl_p = float(ord_item["sl_price"])
             tp_p = float(ord_item["tp_price"])
+            tp_tick = get_twse_tick(tp_p)
+            tp_through = round_twse_tick(tp_p + tp_tick)
             if q["low"] <= sl_p:
                 fill_price = min(q["open"], sl_p)
                 fill_reason = f"盤中觸發停損/移停價 {sl_p} (今日低點 {q['low']})"
-            elif q["high"] >= tp_p:
+            elif q["high"] >= tp_through:
                 fill_price = max(q["open"], tp_p)
-                fill_reason = f"盤中觸發停利目標價 {tp_p} (今日高點 {q['high']})"
+                fill_reason = f"盤中穿價停利目標 {tp_p} (高點 {q['high']} ≥ 穿價門檻 {tp_through})"
 
         if fill_price is not None:
             exec_p = fill_price * (1.0 - SLIPPAGE)
@@ -451,7 +453,9 @@ def run_daily_cycle(
             break
         q = snap[code]
         lim_p = float(ord_item["limit_price"])
-        if q["low"] <= lim_p:
+        buy_tick = get_twse_tick(lim_p)
+        buy_through = round_twse_tick(lim_p - 2.0 * buy_tick)
+        if q["low"] <= buy_through:
             fill_price = min(q["open"], lim_p)
             exec_p = fill_price * (1.0 + SLIPPAGE)
             max_aff = int((float(state["cash"]) * 0.99) // (exec_p * (1.0 + FEE_RATE)))
@@ -472,11 +476,11 @@ def run_daily_cycle(
             state["trade_log"].append({
                 "date": today, "action": "BUY", "code": code, "name": ord_item["name"], "sector": ord_item["sector"],
                 "shares": shares, "price": round(fill_price, 2), "fee_tax": round(fee, 1),
-                "pnl": 0, "ret_pct": 0.0, "reason": f"盤中拉回觸及限價 {lim_p} 成交 (今日低點 {q['low']})",
+                "pnl": 0, "ret_pct": 0.0, "reason": f"穿價2檔買進 {lim_p} 成交 (低點 {q['low']} ≤ 穿價門檻 {buy_through})",
             })
-            events.append(f"買進成交 {ord_item['name']}({code}) {shares}股 @ {fill_price:.1f}")
+            events.append(f"穿價買進 {ord_item['name']}({code}) {shares}股 @ {fill_price:.1f}")
         else:
-            events.append(f"未觸價失效：{ord_item['name']}({code}) 限價 {lim_p} (今日低點 {q['low']})")
+            events.append(f"未穿價2檔失效：{ord_item['name']}({code}) 限價 {lim_p} (需≤{buy_through}，今日低點 {q['low']})")
 
     holdings_val = 0.0
     for code, pos in positions.items():
@@ -496,10 +500,10 @@ def run_daily_cycle(
     above_60 = m0050["close"] > m0050["ma60"]
     if above_20 and above_60:
         regime, max_slots = "BULL", 4
-        regime_label = "🟢 多頭格局 (0050站穩月季線｜上限4檔｜v3四層引擎)"
+        regime_label = "🟢 多頭格局 (0050站穩月季線｜上限4檔｜v3.1穿價四層引擎)"
     elif above_60 or above_20:
         regime, max_slots = "CAUTION", 2
-        regime_label = "🟡 震盪警戒 (0050介於月季線間｜上限2檔｜v3四層引擎)"
+        regime_label = "🟡 震盪警戒 (0050介於月季線間｜上限2檔｜v3.1穿價四層引擎)"
     else:
         regime, max_slots = "BEAR", 0
         regime_label = "🔴 空頭警戒 (0050雙破月季線｜禁止新買進・現金保護)"
@@ -616,7 +620,7 @@ def run_daily_cycle(
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
             placed += 1
 
-    state["version"] = "v3_4layer_t1_65"
+    state["version"] = "v3.1_through_fill_65"
     state["pending_orders"] = new_pending
     net_profit = round(total_eq - START_CAPITAL, 0)
     ret_pct = round((total_eq / START_CAPITAL - 1.0) * 100.0, 2)
