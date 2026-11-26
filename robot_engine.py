@@ -518,9 +518,22 @@ def run_daily_cycle(
     if not snap or "0050" not in snap:
         raise RuntimeError("無法取得 0050 與台股行情，請確認網路連線。")
 
+    # Auto-heal any duplicate or out-of-order dates in equity_history (e.g. from stale Yahoo cache)
+    if state.get("equity_history"):
+        dedup = {}
+        for rec in state["equity_history"]:
+            if rec.get("date"):
+                dedup[rec["date"]] = rec
+        cleaned = [dedup[d] for d in sorted(dedup.keys())]
+        if cleaned != state["equity_history"]:
+            state["equity_history"] = cleaned
+            state["last_run_date"] = cleaned[-1]["date"]
+            save_state(state)
+
     today = snap["0050"]["date"]
-    if (not force) and state.get("last_run_date") == today:
-        return {"status": "skipped", "message": f"交易日 {today} 已完成結算與 AI 簡報。", "state": state}
+    last_d = state.get("last_run_date") or ""
+    if (not force) and last_d and today <= last_d:
+        return {"status": "skipped", "message": f"略過舊/重複資料日 {today} (帳本最新已達 {last_d})。", "state": state}
 
     fund_map = fundamentals_map if fundamentals_map is not None else fetch_official_fundamentals()
     chip_map = chips_map if chips_map is not None else fetch_institutional_chips()
@@ -801,10 +814,9 @@ def run_daily_cycle(
         "bench_0050_equity": bench_eq, "cash": round(float(state["cash"]), 0),
         "holdings_val": round(holdings_val, 0), "regime": regime_label, "summary": summary,
     }
-    if state["equity_history"] and state["equity_history"][-1]["date"] == today:
-        state["equity_history"][-1] = entry
-    else:
-        state["equity_history"].append(entry)
+    dedup = {rec["date"]: rec for rec in state.get("equity_history", []) if rec.get("date")}
+    dedup[today] = entry
+    state["equity_history"] = [dedup[d] for d in sorted(dedup.keys())]
 
     state["last_run_date"] = today
     state["last_run_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
