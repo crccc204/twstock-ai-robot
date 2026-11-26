@@ -19,9 +19,9 @@
   <header class="sticky top-0 z-20 bg-[#0b1120]/95 backdrop-blur border-b border-slate-800 px-4 py-3">
     <div class="max-w-xl mx-auto flex items-center justify-between">
       <div class="flex items-center gap-2.5">
-        <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-500 to-blue-600 flex items-center justify-center text-white font-black text-xs">v2</div>
+        <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-purple-500 to-blue-600 flex items-center justify-center text-white font-black text-xs">v4</div>
         <div>
-          <h1 class="text-sm font-extrabold text-white">10萬元 AI 操盤機器人 (65檔・T+1觸價)</h1>
+          <h1 class="text-sm font-extrabold text-white">10萬元 AI 操盤 v4 (五層量化＋Gemini簡報)</h1>
           <p id="syncLine" class="text-[10px] text-slate-400 font-mono">載入雲端帳本中...</p>
         </div>
       </div>
@@ -47,6 +47,20 @@
         <button type="button" id="copyAllOrdersBtn" class="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-[10px] font-bold text-white">📋 複製全部掛單</button>
       </div>
       <div id="pendingOrdersWrap" class="space-y-2 text-xs"></div>
+    </section>
+
+    <!-- 1.5 Gemini LLM Daily Research Briefing (Top 3-5 Favored Stocks + Global Gurus) -->
+    <section id="aiBriefingSection" class="bg-[#131d31] border border-purple-500/40 rounded-2xl p-4 space-y-3 shadow-lg">
+      <div class="flex items-center justify-between gap-2">
+        <h2 class="text-xs font-extrabold text-purple-300">🧠 AI 投研簡報：精選 3–5 檔看好標的 & 國際大佬動向</h2>
+        <span id="aiEngineTag" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-purple-500/15 text-purple-300 border border-purple-500/30">Gemini</span>
+      </div>
+      <p id="aiMarketView" class="text-xs text-slate-200 leading-relaxed bg-slate-950/70 border border-slate-800 rounded-xl p-3">等待首次 v4 排程產出 AI 投研簡報...</p>
+      <div id="aiTopPicksWrap" class="space-y-2"></div>
+      <div class="pt-2 border-t border-slate-800 space-y-1.5">
+        <div class="text-[11px] font-bold text-amber-300">🌍 國際大佬 (巴菲特/13F) 與外資機構動向</div>
+        <ul id="aiGuruList" class="space-y-1 text-[11px] text-slate-300 list-disc pl-4"></ul>
+      </div>
     </section>
 
     <!-- 2. Equity & Benchmark KPI Cards -->
@@ -136,6 +150,28 @@
             </div>
           `;
         }).join("");
+      }
+
+      // AI Briefing & Global Guru Tracker
+      const ai = st.ai_briefing;
+      if (ai) {
+        document.getElementById("aiEngineTag").textContent = ai.engine || "Gemini AI";
+        document.getElementById("aiMarketView").textContent = ai.market_view || "--";
+        const picks = ai.top_picks || [];
+        document.getElementById("aiTopPicksWrap").innerHTML = picks.map((p, idx) => `
+          <div class="bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs space-y-1">
+            <div class="flex items-center justify-between">
+              <div><span class="font-mono text-purple-400 font-bold">#${idx + 1}</span> <strong class="text-white">${p.name}</strong> <span class="font-mono text-blue-400">${p.code}</span></div>
+              <span class="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/15 text-purple-200 border border-purple-500/30">${p.stance || '看好觀察'}</span>
+            </div>
+            <div class="text-slate-200 text-[11px]">✅ ${p.reason || ''}</div>
+            <div class="text-amber-300/90 text-[10px]">⚠️ 風險：${p.risk || '留意盤勢波動'}</div>
+          </div>
+        `).join("");
+        const gurus = ai.guru_tracker || [];
+        document.getElementById("aiGuruList").innerHTML = gurus.length
+          ? gurus.map(g => `<li>${g}</li>`).join("")
+          : `<li>今日無重大國際大佬動向更新。</li>`;
       }
 
       // KPIs
