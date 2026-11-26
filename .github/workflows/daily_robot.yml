@@ -1,7 +1,8 @@
-name: Daily TWStock 100K AI Robot v2
+name: Daily TWStock 100K AI Robot v4
 
 on:
   schedule:
+    # 05:55 UTC = 13:55 Taipei Time (Mon-Fri, after TWSE close)
     - cron: '55 5 * * 1-5'
   workflow_dispatch:
 
@@ -23,7 +24,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run 65-Stock T+1 Trigger AI Robot
+      - name: Run v4 5-Layer Quant Robot + Daily Gemini AI Briefing
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python robot_engine.py
 
       - name: Commit updated ledger to docs/
@@ -31,5 +34,5 @@ jobs:
           git config user.name "TWStock-AI-Robot"
           git config user.email "bot@users.noreply.github.com"
           git add docs/portfolio_state.json docs/trade_history.csv docs/daily_equity_log.csv
-          git diff --staged --quiet || git commit -m "Daily T+1 robot update $(date -u +'%Y-%m-%d')"
+          git diff --staged --quiet || git commit -m "Daily v4 AI robot update $(date -u +'%Y-%m-%d')"
           git push
