@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-Taiwan Stock NT$100,000 Autonomous Paper-Trading AI Robot (v3.1 — Strict Through-Fill 4-Layer Engine)
-=====================================================================================
-Drop-in upgrade for `robot_engine.py` (100% compatible with existing GitHub Actions,
-requirements.txt, and docs/index.html mobile dashboard).
+Taiwan Stock NT$100,000 Autonomous Paper-Trading AI Robot (v4 — 5-Layer Quant + Gemini LLM Analyst)
+==================================================================================================
+Hybrid Institutional Architecture:
+  [Deterministic Code — Execution & Risk Discipline]
+  1. Market Regime Gate (0050 vs MA20 & MA60): BULL=4 slots, CAUTION=2 slots, BEAR=0 new buys.
+  2. Official Fundamentals (TWSE + TPEx OpenAPI): Monthly Revenue YoY%, PE, Dividend Yield.
+  3. Official Daily Institutional Chips (TWSE T86 + TPEx 3-Insti): Foreign + Trust net lots!
+  4. 65-Stock 12-Sector Trend & Risk-Adjusted Momentum (RS20 / ATR% + CMF10 + RSI 48-74).
+  5. Strict T+1 Through-Fill Execution: Buy fills ONLY if Low <= Limit - 2*Tick;
+     TP fills ONLY if High >= TP + 1*Tick; SL fills conservatively on Low <= SL.
 
-4-Layer Institutional Decision Framework:
-  Layer 1 — Market Regime Gate (0050 vs MA20 & MA60):
-    BULL = up to 4 positions (~24% each), CAUTION = up to 2 positions, BEAR = 0 new buys.
-  Layer 2 — Official Fundamentals & Monthly Revenue (TWSE + TPEx Keyless OpenAPI):
-    Filters out revenue contraction (YoY < -15%) and unsupported high-PE bubbles
-    (PE > 40 without >= 25% YoY growth); rewards strong YoY growth + low PE / high yield.
-  Layer 3 — Price/Volume Trend & Risk-Adjusted Momentum (65-Stock 12-Sector Universe):
-    Confirmed uptrend (Close > MA20, MA5 >= MA20), anti-chasing (<= +10% above MA20,
-    RSI 48-74), positive 20D relative strength vs 0050, sector cap <= 2.
-  Layer 4 — Google News RSS Major Negative-Event Filter (避雷針):
-    Scans recent Chinese financial headlines for the top finalists and automatically
-    skips stocks hit by severe negative news (下修財測 / 砍單 / 虧損 / 違約 / 停工等).
-  Execution — Strict T-Day Pending Smart Orders -> T+1 Real OHLC Trigger Fill:
-    Zero close-price cheating; conservative SL-before-TP tie-break; TWSE Art. 62 ticks;
-    real Taiwan odd-lot frictions (0.1425% fee, 0.30% sell tax, 0.10% slippage/side).
+  [Daily Single-Call Gemini LLM Research Agent — Semantic Analysis & Guru Tracker]
+  - Replaces brittle keyword counting with true LLM semantic news reading (1 API call/day!).
+  - Selects 3-5 favored stocks from the 65-stock pool with clear reasons & risks.
+  - Summarizes Foreign Institutional flows & Global Investing Gurus (Buffett / 13F / Wall St).
+  - Flags genuine semantic red-flag events without ever overriding hard risk rules.
+  - Reads GEMINI_API_KEY securely from environment (GitHub Secrets) — never hardcoded!
 """
 import concurrent.futures
 import csv
@@ -29,6 +26,7 @@ import os
 import re
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -56,7 +54,6 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# 65 High-Liquidity Taiwan Leaders across 12 Diversified Sectors
 UNIVERSE: Dict[str, Dict[str, str]] = {
     # 半導體與晶圓封測
     "2330": {"name": "台積電", "sym": "2330.TW", "sector": "半導體"},
@@ -136,12 +133,6 @@ UNIVERSE: Dict[str, Dict[str, str]] = {
     "2207": {"name": "和泰車", "sym": "2207.TW", "sector": "傳產工業"},
 }
 
-NEWS_RED_FLAGS = [
-    "下修財測", "調降財測", "砍單", "虧損", "重挫", "跌停", "違約",
-    "掏空", "停工", "火災", "遭罰", "不如預期", "調降評等", "大減", "利空", "衰退",
-]
-NEWS_POS_WORDS = ["創高", "大增", "成長", "調升", "滿載", "優於預期", "擴產", "獲利"]
-
 
 def get_twse_tick(price: float) -> float:
     if price < 10.0: return 0.01
@@ -181,11 +172,20 @@ def http_get_json(url: str, timeout: int = 14):
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
+def fetch_rss_headlines(query: str, limit: int = 4) -> List[str]:
+    try:
+        q = urllib.parse.quote(query)
+        url = f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            root = ET.fromstring(resp.read())
+        return [item.findtext("title", "").strip() for item in root.findall(".//item")[:limit] if item.findtext("title")]
+    except Exception:
+        return []
+
+
 def fetch_official_fundamentals() -> Dict[str, dict]:
-    """
-    Fetch official keyless TWSE + TPEx PE, Dividend Yield, PB, and Monthly Revenue YoY%.
-    Gracefully returns partial/empty dict if any exchange endpoint times out.
-    """
+    """Fetch official TWSE + TPEx PE, Dividend Yield, PB, and Monthly Revenue YoY%."""
     urls = {
         "twse_val": "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
         "twse_rev": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
@@ -230,32 +230,148 @@ def fetch_official_fundamentals() -> Dict[str, dict]:
     return fund
 
 
-def check_news_red_flags(stock_name: str, code: str) -> Tuple[bool, str]:
+def fetch_institutional_chips() -> Dict[str, dict]:
     """
-    Scans latest 10 Chinese financial headlines via Google News RSS.
-    Returns (is_blocked, note). Never crashes if offline or blocked.
+    Fetch official daily Foreign Investor (外資) & Investment Trust (投信) net lots
+    from TWSE RWD T86 and TPEx OpenAPI. Gracefully returns {} if unavailable.
     """
+    chips: Dict[str, dict] = {}
+    today = datetime.date.today()
+
+    # 1. TWSE T86 (walk back up to 5 weekdays to match latest trading day)
+    for offset in range(0, 7):
+        d = today - datetime.timedelta(days=offset)
+        if d.weekday() >= 5:
+            continue
+        ymd = d.strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={ymd}&selectType=ALLBUT0999&response=json"
+        try:
+            data = http_get_json(url, timeout=14)
+            if data.get("stat") != "OK" or not data.get("data"):
+                continue
+            fields = data.get("fields") or []
+            idx_code = 0
+            idx_f = next((i for i, f in enumerate(fields) if "外陸資買賣超股數" in f and "不含" in f), 4)
+            idx_t = next((i for i, f in enumerate(fields) if "投信買賣超股數" in f), 10)
+            for row in data["data"]:
+                c = str(row[idx_code]).strip()
+                if c in UNIVERSE:
+                    f_sh = parse_num(row[idx_f]) or 0.0
+                    t_sh = parse_num(row[idx_t]) or 0.0
+                    chips[c] = {
+                        "foreign_lots": round(f_sh / 1000.0, 1),
+                        "trust_lots": round(t_sh / 1000.0, 1),
+                        "inst_lots": round((f_sh + t_sh) / 1000.0, 1),
+                    }
+            if chips:
+                break
+        except Exception as exc:
+            print(f"[Chips TWSE] {ymd} skipped: {exc}")
+
+    # 2. TPEx 3-Institutional Daily Trading OpenAPI
     try:
-        q = urllib.parse.quote(f"{stock_name} {code} 財報 OR 法說 OR 營收")
-        url = f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            root = ET.fromstring(resp.read())
-        titles = [item.findtext("title", "") for item in root.findall(".//item")[:10]]
-        if not titles:
-            return False, "新聞無異常"
-        neg_hits = sum(sum(1 for w in NEWS_RED_FLAGS if w in t) for t in titles)
-        pos_hits = sum(sum(1 for w in NEWS_POS_WORDS if w in t) for t in titles)
-        if neg_hits >= 3 and neg_hits > pos_hits:
-            return True, f"新聞避雷(負面關鍵字{neg_hits}次 > 正面{pos_hits}次)"
-        return False, f"新聞正常(正{pos_hits}/負{neg_hits})"
-    except Exception:
-        return False, "新聞檢查略過"
+        rows = http_get_json("https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading", timeout=14)
+        for r in rows or []:
+            c = str(r.get("SecuritiesCompanyCode", "")).strip()
+            if c in UNIVERSE:
+                f_sh = parse_num(r.get("ForeignInvestorsNetBuySellShares")) or 0.0
+                t_sh = parse_num(r.get("SecuritiesInvestmentTrustCompaniesNetBuySellShares")) or 0.0
+                chips[c] = {
+                    "foreign_lots": round(f_sh / 1000.0, 1),
+                    "trust_lots": round(t_sh / 1000.0, 1),
+                    "inst_lots": round((f_sh + t_sh) / 1000.0, 1),
+                }
+    except Exception as exc:
+        print(f"[Chips TPEx] Warning: {exc}")
+
+    return chips
+
+
+def call_gemini_research_agent(
+    trade_date: str,
+    regime_label: str,
+    m0050: dict,
+    top_candidates: List[dict],
+    guru_headlines: List[str],
+    api_key: str,
+) -> dict:
+    """
+    Single daily Gemini API call (1 request/day!) acting as an institutional research analyst:
+    - Picks 3-5 favored stocks from the 65-stock pool with clear reasons & risks
+    - Tracks global investing gurus (Buffett/13F/Wall St) & foreign flows
+    - Flags genuine severe semantic news red flags (replaces brittle keyword counting)
+    """
+    fallback = {
+        "updated_date": trade_date,
+        "engine": "量化摘要保底 (未設定 GEMINI_API_KEY 或連線逾時)",
+        "market_view": f"目前大盤處於「{regime_label}」，0050 收 {m0050['close']} 元（20日線 {m0050['ma20']} / 60日線 {m0050['ma60']}）。",
+        "top_picks": [
+            {
+                "code": c["code"], "name": c["name"], "stance": "量化強勢",
+                "reason": f"20日相對強度 {c['rs20_pct']:+.1f}%、月營收 {c['rev_str']}、外資+投信 {c['inst_lots']:+.0f}張。",
+                "risk": f"短線留意 RSI {c['rsi14']} 與大盤波動風險。",
+            }
+            for c in top_candidates[:3]
+        ],
+        "guru_tracker": guru_headlines[:3] if guru_headlines else ["今日暫無新增國際大佬／外資動向新聞。"],
+        "red_flag_codes": [],
+    }
+
+    if not api_key or len(api_key.strip()) < 10:
+        return fallback
+
+    prompt = (
+        f"你是專業的台灣股市量化投研分析師。請根據以下 {trade_date} 實盤數據、三大法人籌碼、月營收估值與最新新聞，"
+        f"回傳嚴格的 JSON（不要輸出 Markdown 標記或額外說明文字）。\n\n"
+        f"【大盤環境】{regime_label}｜0050 收盤 {m0050['close']}｜20日線 {m0050['ma20']}｜60日線 {m0050['ma60']}\n\n"
+        f"【65檔核心池量化排名前10檔候選股與最新新聞】\n"
+        + json.dumps(top_candidates[:10], ensure_ascii=False)
+        + "\n\n【國際投資大佬（巴菲特/13F/橋水/ARK）與外資大行最新新聞標題】\n"
+        + json.dumps(guru_headlines[:8], ensure_ascii=False)
+        + "\n\n請回傳以下 JSON 格式（繁體中文、客觀精簡、不誇大）：\n"
+        "{\n"
+        '  "market_view": "2句話總結今日台股大盤結構與操作建議",\n'
+        '  "top_picks": [\n'
+        '    {"code": "代號", "name": "股名", "stance": "偏多觀察/基本面強勢/防禦配置", "reason": "結合技術面+營收估值+外資投信籌碼+新聞的看好理由(40字內)", "risk": "主要風險提醒(25字內)"}\n'
+        '  ],\n'
+        '  "guru_tracker": ["2至3條精簡重點，整理最新外資大行與國際大佬(如巴菲特/13F/對沖基金)動向，若新聞無相關則寫近期無重大變動"],\n'
+        '  "red_flag_codes": ["僅列出最新新聞確實爆發重大實質利空(如下修財測、砍單、虧損、停工、違約)的股票代號，沒地雷請回傳空陣列[]"]\n'
+        "}\n"
+        "注意：top_picks 請從上述候選股中選出最看好的 3 到 5 檔。"
+    )
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+    }).encode("utf-8")
+
+    ctx = ssl.create_default_context()
+    for model_name in ("gemini-2.5-flash", "gemini-2.0-flash"):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={urllib.parse.quote(api_key.strip())}"
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=25, context=ctx) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            txt = body["candidates"][0]["content"]["parts"][0]["text"].strip()
+            txt = re.sub(r"^```json\s*|\s*```$", "", txt, flags=re.DOTALL).strip()
+            parsed = json.loads(txt)
+            return {
+                "updated_date": trade_date,
+                "engine": f"Gemini AI ({model_name})",
+                "market_view": str(parsed.get("market_view") or fallback["market_view"]),
+                "top_picks": (parsed.get("top_picks") or fallback["top_picks"])[:5],
+                "guru_tracker": (parsed.get("guru_tracker") or fallback["guru_tracker"])[:4],
+                "red_flag_codes": [str(x).strip() for x in (parsed.get("red_flag_codes") or [])],
+            }
+        except Exception as exc:
+            print(f"[Gemini LLM] {model_name} failed: {exc}")
+
+    return fallback
 
 
 def default_state() -> dict:
     return {
-        "version": "v3.1_through_fill_65",
+        "version": "v4_5layer_gemini_65",
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "start_capital": START_CAPITAL,
         "cash": START_CAPITAL,
@@ -264,12 +380,13 @@ def default_state() -> dict:
         "benchmark_0050_cash": START_CAPITAL,
         "positions": {},
         "pending_orders": [],
+        "ai_briefing": None,
         "trade_log": [],
         "equity_history": [],
         "last_run_date": "",
         "last_run_time": "",
         "last_regime": "尚未執行",
-        "last_summary": "v3 四層引擎已就緒（大盤濾網 × 官方月營收/PE × 價量動能 × 新聞避雷）。",
+        "last_summary": "v4 五層量化＋Gemini AI 投研簡報引擎已就緒。",
     }
 
 
@@ -315,10 +432,7 @@ def compute_rsi(series: pd.Series, n: int = 14) -> float:
 
 
 def fetch_market_snapshot() -> Dict[str, dict]:
-    import time
     import yfinance as yf
-
-    # Prevent yfinance SQLite cache lock ('database is locked') on GitHub Actions
     try:
         yf.set_tz_cache_location("/tmp/yf_tz_cache")
     except Exception:
@@ -364,8 +478,7 @@ def fetch_market_snapshot() -> Dict[str, dict]:
         except Exception:
             pass
 
-    # Step 1: Download benchmark 0050.TW cleanly with threads=False + retry
-    for attempt in range(3):
+    for _ in range(3):
         try:
             df0050 = yf.download("0050.TW", period="5mo", interval="1d", auto_adjust=True, threads=False, progress=False)
             parse_df("0050", df0050)
@@ -375,7 +488,6 @@ def fetch_market_snapshot() -> Dict[str, dict]:
             pass
         time.sleep(2)
 
-    # Step 2: Download 65 stocks in safe single-threaded batches (zero SQLite lock!)
     items = list(UNIVERSE.items())
     for i in range(0, len(items), 25):
         chunk = items[i:i + 25]
@@ -397,15 +509,10 @@ def fetch_market_snapshot() -> Dict[str, dict]:
 def run_daily_cycle(
     market_snapshot: Optional[Dict[str, dict]] = None,
     fundamentals_map: Optional[Dict[str, dict]] = None,
-    news_checker=None,
+    chips_map: Optional[Dict[str, dict]] = None,
+    llm_fn=None,
     force: bool = False,
 ) -> dict:
-    """
-    Executes ONE strict zero-cheating daily cycle (v3 — 4-Layer Quant Engine):
-    Phase 1: Settle yesterday's pending smart orders against TODAY's real Open/High/Low.
-    Phase 2: Combine Regime + Official Fundamentals (Rev YoY, PE, DY) + Technicals
-             + News Red-Flag Filter to generate TOMORROW's pending smart orders.
-    """
     state = load_state()
     snap = market_snapshot if market_snapshot is not None else fetch_market_snapshot()
     if not snap or "0050" not in snap:
@@ -413,10 +520,10 @@ def run_daily_cycle(
 
     today = snap["0050"]["date"]
     if (not force) and state.get("last_run_date") == today:
-        return {"status": "skipped", "message": f"交易日 {today} 已完成結算與掛單。", "state": state}
+        return {"status": "skipped", "message": f"交易日 {today} 已完成結算與 AI 簡報。", "state": state}
 
     fund_map = fundamentals_map if fundamentals_map is not None else fetch_official_fundamentals()
-    check_news_fn = news_checker if news_checker is not None else check_news_red_flags
+    chip_map = chips_map if chips_map is not None else fetch_institutional_chips()
 
     # Initialize 0050 Benchmark on Day 1
     p0050 = snap["0050"]["close"]
@@ -433,7 +540,7 @@ def run_daily_cycle(
     positions = state["positions"]
 
     # =========================================================================
-    # PHASE 1: Settle Yesterday's Pending Orders Against TODAY's Real OHLC
+    # PHASE 1: Strict T+1 Through-Fill Settlement
     # =========================================================================
     prev_orders = state.get("pending_orders") or []
     for ord_item in [o for o in prev_orders if o["action"] == "SELL"]:
@@ -450,14 +557,13 @@ def run_daily_cycle(
         else:
             sl_p = float(ord_item["sl_price"])
             tp_p = float(ord_item["tp_price"])
-            tp_tick = get_twse_tick(tp_p)
-            tp_through = round_twse_tick(tp_p + tp_tick)
+            tp_through = round_twse_tick(tp_p + get_twse_tick(tp_p))
             if q["low"] <= sl_p:
                 fill_price = min(q["open"], sl_p)
                 fill_reason = f"盤中觸發停損/移停價 {sl_p} (今日低點 {q['low']})"
             elif q["high"] >= tp_through:
                 fill_price = max(q["open"], tp_p)
-                fill_reason = f"盤中穿價停利目標 {tp_p} (高點 {q['high']} ≥ 穿價門檻 {tp_through})"
+                fill_reason = f"盤中穿價停利 {tp_p} (高點 {q['high']} ≥ {tp_through})"
 
         if fill_price is not None:
             exec_p = fill_price * (1.0 - SLIPPAGE)
@@ -468,7 +574,6 @@ def run_daily_cycle(
             pnl = net_proc - float(pos["cost_twd"])
             ret_pct = (net_proc / float(pos["cost_twd"]) - 1.0) * 100.0
             state["cash"] = round(float(state["cash"]) + net_proc, 2)
-
             state["trade_log"].append({
                 "date": today, "action": "SELL", "code": code, "name": pos["name"], "sector": pos["sector"],
                 "shares": int(pos["shares"]), "price": round(fill_price, 2), "fee_tax": round(fee + tax, 1),
@@ -485,8 +590,7 @@ def run_daily_cycle(
             break
         q = snap[code]
         lim_p = float(ord_item["limit_price"])
-        buy_tick = get_twse_tick(lim_p)
-        buy_through = round_twse_tick(lim_p - 2.0 * buy_tick)
+        buy_through = round_twse_tick(lim_p - 2.0 * get_twse_tick(lim_p))
         if q["low"] <= buy_through:
             fill_price = min(q["open"], lim_p)
             exec_p = fill_price * (1.0 + SLIPPAGE)
@@ -498,7 +602,6 @@ def run_daily_cycle(
             fee = max(1.0, gross * FEE_RATE)
             cost_twd = gross + fee
             state["cash"] = round(float(state["cash"]) - cost_twd, 2)
-
             positions[code] = {
                 "name": ord_item["name"], "sector": ord_item["sector"], "shares": shares,
                 "entry_price": round(fill_price, 2), "cost_twd": round(cost_twd, 2),
@@ -508,7 +611,7 @@ def run_daily_cycle(
             state["trade_log"].append({
                 "date": today, "action": "BUY", "code": code, "name": ord_item["name"], "sector": ord_item["sector"],
                 "shares": shares, "price": round(fill_price, 2), "fee_tax": round(fee, 1),
-                "pnl": 0, "ret_pct": 0.0, "reason": f"穿價2檔買進 {lim_p} 成交 (低點 {q['low']} ≤ 穿價門檻 {buy_through})",
+                "pnl": 0, "ret_pct": 0.0, "reason": f"穿價2檔買進 {lim_p} 成交 (低點 {q['low']} ≤ {buy_through})",
             })
             events.append(f"穿價買進 {ord_item['name']}({code}) {shares}股 @ {fill_price:.1f}")
         else:
@@ -521,35 +624,111 @@ def run_daily_cycle(
             pos["peak_price"] = round(max(float(pos["peak_price"]), snap[code]["high"]), 2)
             pos["atr"] = snap[code]["atr14"]
         holdings_val += int(pos["shares"]) * float(pos["last_price"])
-
     total_eq = round(float(state["cash"]) + holdings_val, 0)
 
     # =========================================================================
-    # PHASE 2: 4-Layer Screening & Tomorrow's (T+1) Pending Smart Orders
+    # PHASE 2: 5-Layer Quantitative Ranking (incl. Foreign+Trust Chips) + Daily LLM
     # =========================================================================
     m0050 = snap["0050"]
     above_20 = m0050["close"] > m0050["ma20"]
     above_60 = m0050["close"] > m0050["ma60"]
     if above_20 and above_60:
         regime, max_slots = "BULL", 4
-        regime_label = "🟢 多頭格局 (0050站穩月季線｜上限4檔｜v3.1穿價四層引擎)"
+        regime_label = "🟢 多頭格局 (0050站穩月季線｜上限4檔｜v4五層+AI)"
     elif above_60 or above_20:
         regime, max_slots = "CAUTION", 2
-        regime_label = "🟡 震盪警戒 (0050介於月季線間｜上限2檔｜v3.1穿價四層引擎)"
+        regime_label = "🟡 震盪警戒 (0050介於月季線間｜上限2檔｜v4五層+AI)"
     else:
         regime, max_slots = "BEAR", 0
-        regime_label = "🔴 空頭警戒 (0050雙破月季線｜禁止新買進・現金保護)"
+        regime_label = "🔴 空頭警戒 (0050雙破月季線｜禁止新買進｜v4五層+AI)"
 
+    # Rank ALL 65 stocks for both LLM Research Briefing & Deterministic Order Screening
+    ranked_all = []
+    for code, meta in UNIVERSE.items():
+        if code not in snap:
+            continue
+        q = snap[code]
+        f = fund_map.get(code, {})
+        ch = chip_map.get(code, {})
+        pe, dy, rev_yoy = f.get("pe"), f.get("dy"), f.get("rev_yoy")
+        f_lots = float(ch.get("foreign_lots", 0.0))
+        t_lots = float(ch.get("trust_lots", 0.0))
+        inst_lots = float(ch.get("inst_lots", 0.0))
+
+        dist_ma20 = q["close"] / q["ma20"] - 1.0
+        rs20 = q["ret20"] - m0050["ret20"]
+        atr_pct = q["atr14"] / max(1.0, q["close"])
+
+        # Composite Quantitative Score (Tech + CMF + Fundamentals + Foreign/Trust Chips)
+        tech_s = (rs20 / max(0.015, atr_pct)) * 10.0 + q["cmf10"] * 20.0
+        rev_b = float(np.clip((rev_yoy or 0.0) * 0.25, -4.0, 12.0)) if rev_yoy is not None else 0.0
+        val_b = (5.0 if (pe is not None and 0 < pe <= 18.0) else 0.0) + (4.0 if (dy is not None and dy >= 3.5) else 0.0)
+        chip_b = float(np.clip(np.sign(inst_lots) * np.log1p(abs(inst_lots)) * 1.4, -8.0, 10.0))
+        total_s = round(tech_s + rev_b + val_b + chip_b, 2)
+
+        # Deterministic Hard Entry Gates
+        passes_hard_gates = (
+            code not in positions
+            and q["close"] > q["ma20"]
+            and q["ma5"] >= q["ma20"] * 0.995
+            and dist_ma20 <= 0.10
+            and 48 <= q["rsi14"] <= 74
+            and q["ret1"] > -0.03
+            and rs20 > (0.03 if regime == "CAUTION" else 0.0)
+            and (rev_yoy is None or rev_yoy >= -15.0)
+            and not (pe is not None and pe > 40.0 and (rev_yoy is None or rev_yoy < 25.0))
+            and inst_lots > -5000.0  # Avoid massive foreign/trust dumping
+        )
+
+        ranked_all.append({
+            "score": total_s, "code": code, "name": meta["name"], "sector": meta["sector"],
+            "passes_hard_gates": passes_hard_gates, "close": q["close"], "rs20_pct": round(rs20 * 100, 1),
+            "rsi14": q["rsi14"], "pe": pe, "dy": dy, "rev_yoy": rev_yoy,
+            "rev_str": f"{rev_yoy:+.1f}%" if rev_yoy is not None else "--",
+            "pe_str": f"{pe:.1f}" if pe is not None else "--",
+            "foreign_lots": f_lots, "trust_lots": t_lots, "inst_lots": inst_lots,
+            "q": q,
+        })
+
+    ranked_all.sort(key=lambda x: (1 if x["passes_hard_gates"] else 0, x["score"]), reverse=True)
+
+    # Fetch fresh headlines ONLY for Top 10 stocks + Global Investing Gurus (fast ~2s)
+    llm_top10 = []
+    if market_snapshot is None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+            guru_fut = ex.submit(fetch_rss_headlines, "巴菲特 OR 波克夏 OR 13F OR 外資大行 台股 OR 橋水", 8)
+            news_futs = {ex.submit(fetch_rss_headlines, f"{c['name']} {c['code']} 財報 OR 法說 OR 營收", 3): c["code"] for c in ranked_all[:10]}
+            guru_headlines = guru_fut.result()
+            news_by_code = {news_futs[f]: f.result() for f in concurrent.futures.as_completed(news_futs)}
+    else:
+        guru_headlines = ["巴菲特波克夏最新13F持股報告觀察", "外資法人調整亞洲半導體部位"]
+        news_by_code = {c["code"]: [f"{c['name']}最新營運與法說追蹤"] for c in ranked_all[:10]}
+
+    for c in ranked_all[:10]:
+        llm_top10.append({
+            "code": c["code"], "name": c["name"], "sector": c["sector"], "close": c["close"],
+            "rs20_pct": c["rs20_pct"], "rsi14": c["rsi14"], "rev_str": c["rev_str"], "pe_str": c["pe_str"],
+            "foreign_lots": c["foreign_lots"], "trust_lots": c["trust_lots"], "inst_lots": c["inst_lots"],
+            "passes_buy_gate": c["passes_hard_gates"], "news": news_by_code.get(c["code"], []),
+        })
+
+    # Run Single Daily Gemini LLM Agent Call (reads GEMINI_API_KEY from env / GitHub Secrets)
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    ai_briefing = (
+        llm_fn(today, regime_label, m0050, llm_top10, guru_headlines, api_key)
+        if llm_fn is not None
+        else call_gemini_research_agent(today, regime_label, m0050, llm_top10, guru_headlines, api_key)
+    )
+    red_flag_set = set(ai_briefing.get("red_flag_codes") or [])
+
+    # 2A. OCO Exit / Trend-Break Orders for Held Positions (100% Deterministic Code)
     new_pending: List[dict] = []
-
-    # 2A. OCO Exit / Trend-Break Orders for Held Positions
     for code, pos in positions.items():
         if code not in snap:
             continue
         q = snap[code]
         atr = float(pos.get("atr") or q["atr14"])
-        entry_p = float(pos["entry_price"])
-        peak_p = float(pos["peak_price"])
+        entry_p, peak_p = float(pos["entry_price"]), float(pos["peak_price"])
 
         if q["close"] < q["ma20"] * 0.99:
             new_pending.append({
@@ -560,9 +739,7 @@ def run_daily_cycle(
                 "created_date": today,
             })
         else:
-            hard_sl = max(entry_p * 0.93, entry_p - 1.8 * atr)
-            trail_sl = max(peak_p * 0.92, peak_p - 2.2 * atr)
-            active_sl = round_twse_tick(max(hard_sl, trail_sl))
+            active_sl = round_twse_tick(max(max(entry_p * 0.93, entry_p - 1.8 * atr), max(peak_p * 0.92, peak_p - 2.2 * atr)))
             tp_p = round_twse_tick(entry_p + 3.5 * atr)
             new_pending.append({
                 "action": "SELL", "order_kind": "OCO_STOP_PROFIT", "code": code,
@@ -572,98 +749,51 @@ def run_daily_cycle(
                 "created_date": today,
             })
 
-    # 2B. 4-Layer Entry Filter (Regime + Official Rev YoY/PE/DY + Technicals + News Red-Flag)
+    # 2B. Buy Limit Orders (100% Deterministic Code + Optional LLM Red-Flag Veto)
     open_slots = max(0, max_slots - len(positions))
-    news_skipped = []
-
+    ai_vetoed = []
     if open_slots > 0 and float(state["cash"]) >= 12_000.0:
         sector_counts: Dict[str, int] = {}
         for pos in positions.values():
             sector_counts[pos["sector"]] = sector_counts.get(pos["sector"], 0) + 1
 
-        cands = []
-        for code, meta in UNIVERSE.items():
-            if code in positions or code not in snap:
-                continue
-            q = snap[code]
-            f = fund_map.get(code, {})
-            pe = f.get("pe")
-            dy = f.get("dy")
-            rev_yoy = f.get("rev_yoy")
-
-            dist_ma20 = q["close"] / q["ma20"] - 1.0
-            rs20 = q["ret20"] - m0050["ret20"]
-            atr_pct = q["atr14"] / max(1.0, q["close"])
-
-            # Technical Hard Gates
-            if q["close"] <= q["ma20"] or q["ma5"] < q["ma20"] * 0.995:
-                continue
-            if dist_ma20 > 0.10 or q["rsi14"] < 48 or q["rsi14"] > 74 or q["ret1"] <= -0.03:
-                continue
-            if rs20 <= (0.03 if regime == "CAUTION" else 0.0):
-                continue
-
-            # Fundamental Hard Gates (Layer 2: Official TWSE/TPEx Rev YoY + PE)
-            if rev_yoy is not None and rev_yoy < -15.0:
-                continue  # Reject severe revenue contraction
-            if pe is not None and pe > 40.0 and (rev_yoy is None or rev_yoy < 25.0):
-                continue  # Reject unsupported high-PE bubble
-
-            # Composite Score: Risk-Adjusted Momentum + CMF + Fundamental Growth/Value Bonus
-            tech_s = (rs20 / max(0.015, atr_pct)) * 10.0 + q["cmf10"] * 22.0
-            rev_bonus = float(np.clip((rev_yoy or 0.0) * 0.25, -4.0, 12.0)) if rev_yoy is not None else 0.0
-            val_bonus = (5.0 if (pe is not None and 0 < pe <= 18.0) else 0.0) + (4.0 if (dy is not None and dy >= 3.5) else 0.0)
-            total_s = tech_s + rev_bonus + val_bonus
-            cands.append((total_s, code, meta, q, f))
-
-        cands.sort(key=lambda x: x[0], reverse=True)
+        eligible = [c for c in ranked_all if c["passes_hard_gates"]]
         alloc_per_slot = min(float(state["cash"]) / open_slots * 0.96, total_eq * 0.24)
         placed = 0
-
-        for total_s, code, meta, q, f in cands[:10]:
+        for c in eligible:
             if placed >= open_slots:
                 break
-            sec = meta["sector"]
-            if sector_counts.get(sec, 0) >= MAX_PER_SECTOR:
+            if sector_counts.get(c["sector"], 0) >= MAX_PER_SECTOR:
                 continue
-
-            # Layer 4: News Major Red-Flag Filter on top finalists only!
-            blocked, news_note = check_news_fn(meta["name"], code)
-            if blocked:
-                news_skipped.append(f"{meta['name']}({code}): {news_note}")
+            if c["code"] in red_flag_set:
+                ai_vetoed.append(f"{c['name']}({c['code']})")
                 continue
-
+            q = c["q"]
             lim_buy = round_twse_tick(q["close"] - 0.30 * q["atr14"])
             sl_p = round_twse_tick(max(lim_buy * 0.93, lim_buy - 1.8 * q["atr14"]))
             tp_p = round_twse_tick(lim_buy + 3.5 * q["atr14"])
             shares = int(alloc_per_slot // (lim_buy * (1.0 + SLIPPAGE + FEE_RATE)))
             if shares < 1:
                 continue
-
-            rev_str = f"營收{f['rev_yoy']:+.1f}%" if f.get("rev_yoy") is not None else "營收--"
-            pe_str = f"PE {f['pe']:.1f}" if f.get("pe") is not None else "PE --"
             new_pending.append({
-                "action": "BUY", "order_kind": "LIMIT_PULLBACK", "code": code,
-                "name": meta["name"], "sector": sec, "shares": shares,
+                "action": "BUY", "order_kind": "LIMIT_PULLBACK", "code": c["code"],
+                "name": c["name"], "sector": c["sector"], "shares": shares,
                 "limit_price": lim_buy, "sl_price": sl_p, "tp_price": tp_p,
-                "reason": f"RS {(q['ret20']-m0050['ret20'])*100:+.1f}%｜{rev_str}｜{pe_str}｜{news_note}",
+                "reason": f"RS {c['rs20_pct']:+.1f}%｜營收{c['rev_str']}｜PE {c['pe_str']}｜法人{c['inst_lots']:+.0f}張",
                 "created_date": today,
             })
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            sector_counts[c["sector"]] = sector_counts.get(c["sector"], 0) + 1
             placed += 1
 
-    state["version"] = "v3.1_through_fill_65"
+    state["version"] = "v4_5layer_gemini_65"
     state["pending_orders"] = new_pending
+    state["ai_briefing"] = ai_briefing
     net_profit = round(total_eq - START_CAPITAL, 0)
     ret_pct = round((total_eq / START_CAPITAL - 1.0) * 100.0, 2)
 
-    parts = []
-    if events:
-        parts.append("；".join(events))
-    else:
-        parts.append(f"今日無觸價成交｜已開出明日 {len(new_pending)} 筆掛單")
-    if news_skipped:
-        parts.append("新聞避雷跳過：" + "、".join(news_skipped))
+    parts = ["; ".join(events) if events else f"今日無觸價成交｜已開出明日 {len(new_pending)} 筆掛單"]
+    if ai_vetoed:
+        parts.append("AI語意避雷跳過：" + "、".join(ai_vetoed))
     summary = "｜".join(parts)
 
     entry = {
@@ -681,7 +811,7 @@ def run_daily_cycle(
     state["last_regime"] = regime_label
     state["last_summary"] = summary
     save_state(state)
-    return {"status": "ok", "date": today, "entry": entry, "pending_count": len(new_pending), "state": state}
+    return {"status": "ok", "date": today, "entry": entry, "state": state}
 
 
 if __name__ == "__main__":
