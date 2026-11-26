@@ -1,5 +1,10 @@
 name: Daily TWStock 100K AI Robot v4
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+  
 on:
   schedule:
     # 05:55 UTC = 13:55 Taipei Time (Mon-Fri, after TWSE close)
